@@ -1,141 +1,141 @@
-from collections import defaultdict
+import pandas as pd
+from collections import defaultdict, deque
 
+# -------------------
+# 1. Read Inputs from CSV Files
+# -------------------
+systems_df = pd.read_csv("systems.csv")
+pipes_df = pd.read_csv("pipes.csv")
+flows_df = pd.read_csv("initial_flows.csv")
 
-# --------------------------
-# 1. CONFIG: Systems and Flows
-# --------------------------
-systems = {
-    'A': {'supply': 5, 'demand': 3},
-    'B': {'supply': 2, 'demand': 4},
-    'C': {'supply': 0, 'demand': 2},
-    'D': {'supply': 4, 'demand': 3}
-}
+systems = {row['system']: {'supply': row['supply'], 'demand': row['demand']} for _, row in systems_df.iterrows()}
 
-flows = [
-    ('A', 'B', 3),
-    ('B', 'A', 1),
-    ('B', 'C', 2),
-    ('C', 'B', 0),
-    ('A', 'D', 1),
-    ('D', 'A', 0)
-]
+pipe_capacities = {(row['from'], row['to']): row['capacity'] for _, row in pipes_df.iterrows()}
 
-# --------------------------
-# 2. Display Initial Setup
-# --------------------------
-print("\n--- INITIAL SITUATION ---")
-print("Systems (Supply & Demand):")
+pre_existing_flows = {(row['from'], row['to']): row['flow'] for _, row in flows_df.iterrows()}
+
+# -------------------
+# 2. Initial Balance Check
+# -------------------
 for system, values in systems.items():
-    print(f"{system}: Supply={values['supply']}MW, Demand={values['demand']}MW")
+    local_supply = values['supply']
+    incoming_flows = sum(flow for (src, dst), flow in pre_existing_flows.items() if dst == system)
+    total_available = local_supply + incoming_flows
 
-print("\nFlows (Initial bidirectional flows):")
-for f in flows:
-    print(f"{f[0]} → {f[1]}: {f[2]} MW")
+    if total_available < values['demand']:
+        raise ValueError(f"❌ System {system} starts with a shortage!")
 
-# --------------------------
-# 3. Calculate Net Flows (Combining bidirectional flows)
-# --------------------------
+# -------------------
+# 3. Netting Flows
+# -------------------
 net_flows = defaultdict(float)
 
-for from_node, to_node, flow in flows:
-    key = tuple(sorted([from_node, to_node]))
-    if key == (from_node, to_node):
-        net_flows[key] += flow
-    else:
-        net_flows[key] -= flow
+for (from_system, to_system), flow in pre_existing_flows.items():
+    net_flows[(from_system, to_system)] += flow
+    net_flows[(to_system, from_system)] -= flow
 
-# --------------------------
-# 4. Calculate System Balances
-# --------------------------
-net_energy_balance = defaultdict(float)
-
-# Apply net flows
+# Cancel counterflows (keep dominant direction)
+final_flows = defaultdict(float)
 for (a, b), net_flow in net_flows.items():
     if net_flow > 0:
-        net_energy_balance[a] -= net_flow
-        net_energy_balance[b] += net_flow
-    elif net_flow < 0:
-        net_energy_balance[a] += abs(net_flow)
-        net_energy_balance[b] -= abs(net_flow)
+        final_flows[(a, b)] = net_flow
 
-# Add local supply and demand
-for system, values in systems.items():
-    net_energy_balance[system] += values['supply'] - values['demand']
+# -------------------
+# 4. Balance Check After Netting
+# -------------------
+def compute_system_balance(final_flows):
+    balance = defaultdict(float)
+    for system, values in systems.items():
+        balance[system] = values['supply'] - values['demand']
 
-# --------------------------
-# 5. Display Net Flows + Balances Before Adjustment
-# --------------------------
-print("\n--- NET FLOWS (Dominant Directions) ---")
-for (a, b), net_flow in net_flows.items():
-    if net_flow > 0:
-        print(f"{a} → {b}: {net_flow:.2f} MW")
-    elif net_flow < 0:
-        print(f"{b} → {a}: {abs(net_flow):.2f} MW")
-    else:
-        print(f"{a} ↔ {b}: No net flow")
+    for (a, b), flow in final_flows.items():
+        balance[a] -= flow
+        balance[b] += flow
 
-print("\n--- ENERGY BALANCE (Before Adjustment) ---")
-shortages = {}
-surpluses = {}
+    return balance
 
-for system, balance in net_energy_balance.items():
-    status = "✅ OK" if balance >= 0 else "❌ SHORTAGE"
-    if balance < 0:
-        shortages[system] = -balance
-    elif balance > 0:
-        surpluses[system] = balance
-    print(f"{system}: {balance:.2f} MW ({status})")
 
-# --------------------------
-# 6. Attempt to Fix Shortages Greedily
-# --------------------------
-new_flows = []
+balances = compute_system_balance(final_flows)
 
-for shortage_system, shortage_amount in shortages.items():
-    for surplus_system, surplus_amount in surpluses.items():
-        if surplus_amount <= 0:
+print("\nSystem Balance After Netting:")
+for system, bal in balances.items():
+    print(f"  {system}: {bal:.2f} MW")
+
+# -------------------
+# 5. Rescue Flows Using Paths (Capacity-Aware & Safe)
+# -------------------
+graph = defaultdict(list)
+for (a, b), cap in pipe_capacities.items():
+    graph[a].append((b, cap))
+    graph[b].append((a, cap))
+
+
+def find_path(source, target, needed):
+    queue = deque([(source, [], float('inf'))])
+    visited = set()
+
+    while queue:
+        current, path, capacity = queue.popleft()
+
+        if current == target:
+            return path, capacity
+
+        if current in visited:
             continue
+        visited.add(current)
 
-        # Determine how much we can transfer
-        transfer_amount = min(shortage_amount, surplus_amount)
+        for neighbor, cap in graph[current]:
+            if neighbor not in visited:
+                available = min(cap, capacity)
+                queue.append((neighbor, path + [(current, neighbor)], available))
 
-        # Create a flow to cover the shortage
-        new_flows.append((surplus_system, shortage_system, transfer_amount))
+    return None, 0
 
-        # Update the balances and surpluses
-        net_energy_balance[shortage_system] += transfer_amount
-        net_energy_balance[surplus_system] -= transfer_amount
 
-        shortages[shortage_system] -= transfer_amount
-        surpluses[surplus_system] -= transfer_amount
+while any(bal < 0 for bal in balances.values()):
+    progress_made = False
 
-        # If this shortage is resolved, stop searching
-        if shortages[shortage_system] <= 0:
-            break
+    for system, bal in balances.items():
+        if bal < 0:
+            for donor, donor_balance in balances.items():
+                if donor_balance > 0:
+                    path, capacity = find_path(donor, system, -bal)
 
-# --------------------------
-# 7. Display New Flows
-# --------------------------
-if new_flows:
-    print("\n--- ADDED FLOWS TO BALANCE SHORTAGES ---")
-    for from_node, to_node, flow in new_flows:
-        print(f"{from_node} → {to_node}: {flow:.2f} MW")
-else:
-    print("\n✅ No additional flows needed.")
+                    if path:
+                        flow_amount = min(-bal, donor_balance, capacity)
 
-# --------------------------
-# 8. Final Check and Display
-# --------------------------
-print("\n--- FINAL ENERGY BALANCE ---")
-for system, balance in net_energy_balance.items():
-    status = "✅ OK" if balance >= 0 else "❌ SHORTAGE"
-    print(f"{system}: {balance:.2f} MW ({status})")
+                        for (a, b) in path:
+                            final_flows[(a, b)] += flow_amount
 
-# --------------------------
-# 9. Optional: Combine Original and New Flows
-# --------------------------
-combined_flows = flows + new_flows
+                        balances = compute_system_balance(final_flows)
 
-print("\n--- FINAL FLOW PLAN ---")
-for f in combined_flows:
-    print(f"{f[0]} → {f[1]}: {f[2]:.2f} MW")
+                        print(f"Rescue Flow: {donor} → {system} via {path}: {flow_amount:.2f} MW")
+                        progress_made = True
+                        break
+
+            if progress_made:
+                break
+
+    if not progress_made:
+        print(f"⚠️ Could not resolve shortage for one or more systems. Capacity or connections are insufficient.")
+        break
+
+# -------------------
+# 6. Final Output
+# -------------------
+print("\n=== FINAL SOLUTION ===")
+
+print("System Balances:")
+for system, bal in balances.items():
+    status = "✅ Balanced" if bal == 0 else "❌ Shortage"
+    print(f"  {system}: {bal:.2f} MW ({status})")
+
+print("\nFinal Flows:")
+for (a, b), flow in final_flows.items():
+    if flow > 0:
+        print(f"  {a} → {b}: {flow:.2f} MW")
+
+print("\nPipe Utilization:")
+for (a, b), capacity in pipe_capacities.items():
+    used_flow = final_flows.get((a, b), 0)
+    print(f"  {a} → {b}: {used_flow:.2f} MW / {capacity} MW")
